@@ -22,7 +22,8 @@ import math
 from absl.testing import parameterized
 import tensorflow as tf
 
-from tensorflow_ranking.python import losses_impl
+from tensorflow_ranking.python import losses_impl, xgb_pairwise
+from tensorflow.python.ops import math_ops
 
 
 def ln(x):
@@ -705,6 +706,32 @@ class PairwiseHingeLossTest(tf.test.TestCase):
     expected = (hingeloss(3. - 2.) + hingeloss(1. - 2.) + hingeloss(3. - 1.) +
                 hingeloss(3. - 2.)) / 4.
     self.assertAllClose(result, expected)
+
+  def test_gradient(self):
+      scores = [0.4, 0.1, 0.6]
+      labels = [1,2,3]
+      scores = tf.constant(scores)
+      labels = -tf.constant(labels, dtype=tf.int32)
+      loss_fn = losses_impl.PairwiseHingeLossArbitraryMargin(name=None)
+      with tf.GradientTape(persistent=True) as g:
+          g.watch(scores)
+          with tf.GradientTape(persistent=True) as g2:
+              g2.watch(scores)
+              scores = loss_fn.get_logits(scores)
+              logits = tf.nn.sigmoid(scores)
+              pairwise_logits = tf.subtract(tf.expand_dims(logits, 1), logits)
+              pairwise_labels = tf.subtract(tf.expand_dims(labels, 1), labels)
+              pairwise_logits = tf.where(pairwise_labels>0, pairwise_logits, -pairwise_logits)
+              losses, loss_weights = loss_fn._compute_unreduced_loss_impl2(
+                  pairwise_labels, pairwise_logits)
+              loss_weights = tf.cast(pairwise_labels!=0, tf.float32)
+              weighted_losses = math_ops.multiply(losses, loss_weights)
+              loss_final = math_ops.reduce_sum(weighted_losses, axis=1)
+              loss_len = math_ops.reduce_sum(loss_weights, axis=1)
+              loss_final = loss_final / loss_len
+          dz_dx = g2.jacobian(loss_final, scores)
+          dz_dx_sum = tf.reduce_sum(dz_dx, axis=1)
+      dz_dx2 = g.jacobian(dz_dx_sum, scores)
 
   def test_pairwise_hinge_loss_should_handle_per_list_weights(self):
     scores = [[1., 3., 2.], [1., 2., 3.]]

@@ -25,6 +25,9 @@ import tensorflow as tf
 
 from tensorflow_ranking.python import utils
 
+from tensorflow.python.framework import dtypes
+from tensorflow.python.ops import math_ops, array_ops
+
 # The smallest probability that is used to derive smallest logit for invalid or
 # padding entries.
 _EPSILON = 1e-10
@@ -62,6 +65,11 @@ def _apply_pairwise_op(op, tensor):
   """Applies the op on tensor in the pairwise manner."""
   _check_tensor_shapes([tensor])
   return op(tf.expand_dims(tensor, 2), tf.expand_dims(tensor, 1))
+
+
+def _apply_pairwise_op_1vM(op, tensor, tensors):
+  """Applies the op on tensor in the pairwise manner."""
+  return op(tensor, tensors)
 
 
 def _get_valid_pairs_and_clean_labels(labels):
@@ -252,6 +260,10 @@ class AbstractDCGLambdaWeight(_LambdaWeight):
     """
     raise NotImplementedError('Calling an abstract method.')
 
+  @abc.abstractmethod
+  def _pair_rank_discount_1vM(self, rank, ranks, topn):
+    raise NotImplementedError('Calling an abstract method.')
+
   def pair_weights(self, labels, ranks):
     """See `_LambdaWeight`."""
     with tf.compat.v1.name_scope(name='dcg_lambda_weight'):
@@ -270,6 +282,30 @@ class AbstractDCGLambdaWeight(_LambdaWeight):
       list_size = tf.shape(input=labels)[1]
       topn = self._topn or list_size
       pair_weight = tf.abs(pair_gain) * self._pair_rank_discount(ranks, topn)
+
+      # For LambdaLoss with relative rank difference, the scale of loss becomes
+      # much smaller when applying LambdaWeight. This affects the training can
+      # make the optimal learning rate become much larger. We use a heuristic to
+      # scale it up to the same magnitude as standard pairwise loss.
+      pair_weight *= tf.cast(tf.shape(input=labels)[1], dtype=tf.float32)
+      return pair_weight
+
+  def pair_weights_1vM(self, label, labels, rank, ranks):
+    """See `_LambdaWeight`."""
+    with tf.compat.v1.name_scope(name='dcg_lambda_weight_1vM'):
+      gain = self._gain_fn(labels)
+      if self._normalized:
+        gain *= inverse_max_dcg(
+            labels,
+            gain_fn=self._gain_fn,
+            rank_discount_fn=self._rank_discount_fn,
+            topn=self._topn)
+      gain_label = tf.gather_nd(params=gain, indices=tf.where(tf.equal(label, labels))[:1])
+      pair_gain = _apply_pairwise_op_1vM(tf.subtract, gain_label, gain)
+
+      list_size = tf.shape(input=labels)[1]
+      topn = self._topn or list_size
+      pair_weight = tf.abs(pair_gain) * self._pair_rank_discount_1vM(rank, ranks, topn)
 
       # For LambdaLoss with relative rank difference, the scale of loss becomes
       # much smaller when applying LambdaWeight. This affects the training can
@@ -368,6 +404,43 @@ class DCGLambdaWeight(AbstractDCGLambdaWeight):
     pair_mask = _apply_pairwise_op(tf.logical_or, tf.less_equal(ranks, topn))
     return pair_discount * tf.cast(pair_mask, dtype=tf.float32)
 
+  def _pair_rank_discount_1vM(self, rank, ranks, topn):
+    """See `_LambdaWeight`."""
+
+    def _discount_for_relative_rank_diff():
+      pair_valid_rank = _apply_pairwise_op_1vM(tf.logical_or,
+                                           tf.less_equal(rank, topn),
+                                           tf.less_equal(ranks, topn))
+      rank_diff = tf.cast(
+          tf.abs(_apply_pairwise_op_1vM(tf.subtract, rank, ranks)), dtype=tf.float32)
+      pair_discount = tf.where(
+          tf.logical_and(tf.greater(rank_diff, 0.), pair_valid_rank),
+          tf.abs(
+              self._rank_discount_fn(rank_diff) -
+              self._rank_discount_fn(rank_diff + 1)), tf.zeros_like(rank_diff))
+      return pair_discount
+
+    def _discount_for_absolute_rank():
+      """Standard discount in the LambdaMART paper."""
+      # When the rank discount is (1 / rank) for example, the discount is
+      # |1 / r_i - 1 / r_j|. When i or j > topn, the discount becomes 0.
+      rank_discount_rank = tf.compat.v1.where(
+          tf.greater(rank, topn),
+          tf.zeros_like(tf.cast(rank, dtype=tf.float32)),
+          self._rank_discount_fn(tf.cast(rank, dtype=tf.float32)))
+      rank_discount = tf.compat.v1.where(
+          tf.greater(ranks, topn),
+          tf.zeros_like(tf.cast(ranks, dtype=tf.float32)),
+          self._rank_discount_fn(tf.cast(ranks, dtype=tf.float32)))
+      pair_discount = tf.abs(_apply_pairwise_op_1vM(tf.subtract, rank_discount_rank, rank_discount))
+      return pair_discount
+
+    u = _discount_for_relative_rank_diff()
+    v = _discount_for_absolute_rank()
+    pair_discount = (1. - self._smooth_fraction) * u + self._smooth_fraction * v
+    pair_mask = _apply_pairwise_op_1vM(tf.logical_or, tf.less_equal(rank, topn), tf.less_equal(ranks, topn))
+    return pair_discount * tf.cast(pair_mask, dtype=tf.float32)
+
 
 class DCGLambdaWeightV2(AbstractDCGLambdaWeight):
   """The V2 version of LambdaWeight for DCG metric.
@@ -382,6 +455,22 @@ class DCGLambdaWeightV2(AbstractDCGLambdaWeight):
     rank_diff = tf.cast(
         tf.abs(_apply_pairwise_op(tf.subtract, ranks)), dtype=tf.float32)
     max_rank = tf.cast(_apply_pairwise_op(tf.math.maximum, ranks), tf.float32)
+    multiplier = tf.where(
+        tf.greater(max_rank, tf.cast(topn, tf.float32)),
+        1. / (1. - self._rank_discount_fn(max_rank)), 1.)
+    pair_discount = tf.where(
+        tf.greater(rank_diff, 0.),
+        tf.abs(
+            self._rank_discount_fn(rank_diff) -
+            self._rank_discount_fn(rank_diff + 1)) * multiplier,
+        tf.zeros_like(rank_diff))
+    return pair_discount
+
+  def _pair_rank_discount_1vM(self, rank, ranks, topn):
+    """Implements the rank discount for pairs in topn metrics."""
+    rank_diff = tf.cast(
+        tf.abs(_apply_pairwise_op_1vM(tf.subtract, rank, ranks)), dtype=tf.float32)
+    max_rank = tf.cast(_apply_pairwise_op_1vM(tf.math.maximum, rank, ranks), tf.float32)
     multiplier = tf.where(
         tf.greater(max_rank, tf.cast(topn, tf.float32)),
         1. / (1. - self._rank_discount_fn(max_rank)), 1.)
@@ -521,6 +610,17 @@ def _pairwise_comparison(labels, logits, mask, pairwise_logits_op=tf.subtract):
       tf.greater(pairwise_label_diff, 0), dtype=tf.float32)
   valid_pair = _apply_pairwise_op(tf.logical_and, mask)
   pairwise_labels *= tf.cast(valid_pair, dtype=tf.float32)
+  return pairwise_labels, pairwise_logits
+
+
+def _pairwise_comparison_1vM(label, logit, labels, logits, mask, pairwise_logits_op=tf.subtract):
+  pairwise_label_diff = _apply_pairwise_op_1vM(tf.subtract, label, labels)
+  pairwise_logits = _apply_pairwise_op_1vM(pairwise_logits_op, logit, logits)
+  pairwise_logits = tf.where(pairwise_label_diff > 0, pairwise_logits, -pairwise_logits)
+  # Only keep the case when l_i != l_j.
+  pairwise_labels = tf.cast(
+      tf.not_equal(pairwise_label_diff, 0), dtype=tf.float32)
+  pairwise_labels *= tf.cast(mask, dtype=tf.float32)
   return pairwise_labels, pairwise_logits
 
 
@@ -729,6 +829,23 @@ class _RankingLoss(object, metaclass=abc.ABCMeta):
     """
     raise NotImplementedError('Calling an abstract method.')
 
+  @abc.abstractmethod
+  def _compute_unreduced_loss_impl_1vM(self, label, logit, labels, logits, mask=None):
+    """Implementation for the unreduced loss.
+
+    Args:
+      labels: A `Tensor` of the same shape as `logits` representing graded
+        relevance.
+      logits: A `Tensor` with shape [batch_size, list_size]. Each value is the
+        ranking score of the corresponding item.
+      mask: An optional `Tensor` of the same shape as logits indicating which
+        entries are valid for computing the loss.
+
+    Returns:
+      A tuple(losses, loss_weights) that have the same shape.
+    """
+    raise NotImplementedError('Calling an abstract method.')
+
   def normalize_weights(self, labels, weights):
     """Normalizes weights.
 
@@ -753,6 +870,11 @@ class _RankingLoss(object, metaclass=abc.ABCMeta):
     return self._normalize_weights_impl(labels, weights)
 
   def _normalize_weights_impl(self, labels, weights):
+    """See `normalize_weights`."""
+    del labels
+    return 1.0 if weights is None else weights
+
+  def _normalize_weights_impl_1vM(self, labels, weights):
     """See `normalize_weights`."""
     del labels
     return 1.0 if weights is None else weights
@@ -799,6 +921,25 @@ class _RankingLoss(object, metaclass=abc.ABCMeta):
         self._normalize_weights_impl(labels, weights), loss_weights)
     return tf.compat.v1.losses.compute_weighted_loss(
         losses, weights, reduction=reduction)
+
+  def compute_1vM(self, label, logit, labels, logits, weights, reduction, mask=None):
+    logit = self.get_logits(logit)
+    logits = self.get_logits(logits)
+    losses, loss_weights = self._compute_unreduced_loss_impl_1vM(
+        label, logit, labels, logits, mask)
+    weights = tf.multiply(
+        math_ops.cast(self._normalize_weights_impl_1vM(labels, weights), dtype=dtypes.float32), loss_weights)
+    losses = math_ops.cast(losses, dtype=dtypes.float32)
+    weights = math_ops.cast(weights, dtype=dtypes.float32)
+    weighted_losses = math_ops.multiply(losses, weights)
+    if reduction == tf.compat.v1.losses.Reduction.NONE:
+      loss = weighted_losses
+    else:
+      loss = math_ops.reduce_sum(weighted_losses)
+      if reduction == tf.compat.v1.losses.Reduction.MEAN:
+        loss = math_ops.div_no_nan(
+          loss, math_ops.reduce_sum(array_ops.ones_like(losses) * weights))
+    return loss
 
   @abc.abstractmethod
   def compute_per_list(self, labels, logits, weights, mask=None):
@@ -870,6 +1011,38 @@ class _PairwiseLoss(_RankingLoss, metaclass=abc.ABCMeta):
         pairwise_weights, name='weights_stop_gradient')
     return self._pairwise_loss(pairwise_logits), pairwise_weights
 
+  def _compute_unreduced_loss_impl_1vM(self, label, logit, labels, logits, mask=None):
+    """See `_RankingLoss`."""
+    label = tf.cast(tf.expand_dims(label, 0), tf.float32)
+    logit = tf.cast(tf.expand_dims(logit, 0), tf.float32)
+    labels = tf.cast(tf.expand_dims(labels, 0), tf.float32)
+    logits = tf.cast(tf.expand_dims(logits, 0), tf.float32)
+    if mask is None:
+      mask = tf.cast(tf.ones_like(labels), tf.bool)
+    if self._lambda_weight is not None:
+      ranks = _compute_ranks(logits, mask)
+      rank = tf.gather_nd(params=ranks, indices=tf.where(tf.equal(tf.cast(logit, tf.float32),
+                                                                  tf.cast(logits, tf.float32)))[:1])
+      rank = tf.expand_dims(rank, 0)
+    pairwise_labels, pairwise_logits = _pairwise_comparison_1vM(
+      label, logit, labels, logits, mask)
+    pairwise_weights = pairwise_labels
+    if self._lambda_weight is not None:
+      pairwise_weights *= self._lambda_weight.pair_weights_1vM(label, labels, rank, ranks)
+
+    pairwise_logits = tf.reshape(pairwise_logits, [-1])
+    pairwise_weights = tf.reshape(pairwise_weights, [-1])
+    pairwise_weights = tf.stop_gradient(
+        pairwise_weights, name='1dim_weights_stop_gradient')
+    return self._pairwise_loss(pairwise_logits), pairwise_weights
+
+  def _compute_unreduced_loss_impl2(self, pairwise_labels, pairwise_logits, mask=None):
+    """See `_RankingLoss`."""
+    pairwise_weights = pairwise_labels
+    pairwise_weights = tf.stop_gradient(
+        pairwise_weights, name='weights_stop_gradient')
+    return self._pairwise_loss(pairwise_logits), pairwise_weights
+
   def compute_per_list(self, labels, logits, weights, mask=None):
     """See `_RankingLoss`."""
     # Prepare input params.
@@ -916,6 +1089,12 @@ class _PairwiseLoss(_RankingLoss, metaclass=abc.ABCMeta):
         tf.ones_like(labels) * weights, tf.zeros_like(labels))
     return tf.expand_dims(weights, axis=2)
 
+  def _normalize_weights_impl_1vM(self, labels, weights):
+    if weights is None:
+      weights = 1.
+    weights = tf.ones_like(labels) * weights
+    return tf.expand_dims(weights, axis=0)
+
 
 class PairwiseLogisticLoss(_PairwiseLoss):
   """Implements pairwise logistic loss."""
@@ -933,6 +1112,18 @@ class PairwiseHingeLoss(_PairwiseLoss):
   def _pairwise_loss(self, pairwise_logits):
     """See `_PairwiseLoss`."""
     return tf.nn.relu(1 - pairwise_logits)
+
+
+class PairwiseHingeLossArbitraryMargin(_PairwiseLoss):
+  """Implements pairwise hinge loss."""
+
+  def __init__(self, margin=0, *args, **kargs):
+    self.margin = margin
+    super(PairwiseHingeLossArbitraryMargin, self).__init__(*args, **kargs)
+
+  def _pairwise_loss(self, pairwise_logits):
+    """See `_PairwiseLoss`."""
+    return tf.nn.relu(self.margin-pairwise_logits)
 
 
 class PairwiseSoftZeroOneLoss(_PairwiseLoss):
